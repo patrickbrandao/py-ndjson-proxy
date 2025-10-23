@@ -31,8 +31,7 @@ REDIS_TTL = 600
 INTERVAL = 200  # milissegundos
 PAUSE = 20  # milissegundos
 MAXTIME = 45000  # milissegundos
-MAXTIME_ERROR = '{"error": "timeout"}'
-SERVERNAME = "py-ndjson-proxy"
+MAXTIME_ERROR = ""
 
 # Cliente Redis global
 redis_client = None
@@ -54,7 +53,7 @@ def parse_arguments():
     global HTTP_PORT, REDIS_SERVER, REDIS_PASSWORD, REDIS_CHANNEL
     global REDIS_KEY_PREFIX, REDIS_LIST_PREFIX, REDIS_TTL
     global INTERVAL, PAUSE, MAXTIME, DEBUG
-    global MAXTIME_ERROR, SERVERNAME
+    global MAXTIME_ERROR
     
     parser = argparse.ArgumentParser(
         description='py-ndjson-proxy - Middleware HTTP para streaming NDJSON via Redis'
@@ -131,12 +130,6 @@ def parse_arguments():
         default=os.getenv('MAXTIME_ERROR', MAXTIME_ERROR),
         help=f'Mensagem de erro timeout (padrão: {MAXTIME_ERROR})'
     )
-    
-    parser.add_argument(
-        '-s', '--servername',
-        default=os.getenv('SERVERNAME', SERVERNAME),
-        help=f'Nome do servidor HTTP (padrão: {SERVERNAME})'
-    )
 
     parser.add_argument(
         '-d', '--debug',
@@ -159,7 +152,6 @@ def parse_arguments():
     PAUSE = args.pause
     MAXTIME = args.maxtime
     MAXTIME_ERROR = args.maxtime_error
-    SERVERNAME = args.servername
     DEBUG = args.debug
 
 
@@ -265,9 +257,11 @@ def create_task(headers_dict, body_data):
     # Publicar notificação no canal
     redis_client.publish(REDIS_CHANNEL, task_key)
     
-    print(f"[INFO] Tarefa criada..: {task_uuid}")
-    print(f"[INFO] Chave da tarefa: {task_key}")
-    print(f"[INFO] Lista da tarefa: {task_list}")
+    print(f"[INFO] Tarefa criada...: {task_uuid}")
+    print(f"[INFO] Chave da tarefa.: {task_key}")
+    print(f"[INFO] Lista da tarefa.: {task_list}")
+    print(f"[INFO] Cabecalhos http.: {headers_dict}")
+    print(f"[INFO] Payload recebido: {body_data}")
     
     return task_uuid, task_key, task_list
 
@@ -286,100 +280,109 @@ def stream_generator(task_uuid, task_key, task_list):
     """
     start_time = time.time()
     last_message_time = start_time
-    key_missed = False
+    task_completed = False
+    slow_interval = INTERVAL / 1000.0
+    fast_interval = PAUSE / 1000.0
+    step_interval = slow_interval
 
     print(f"[INFO] Iniciando tarefa")
     print(f"[INFO] - Nova chave: {task_key}")
 
     try:
         while True:
+
             # Verificar se a chave da tarefa ainda existe
             if not redis_client.exists(task_key):
                 if DEBUG:
                     print(f"[DEBUG] Chave ausente: {task_key}, descarregar lista e finalizar")
-                key_missed = True
+                task_completed = True
             #endif
 
-            # Tentar consumir mensagem da lista (LPOP)
-            message = redis_client.lpop(task_list)
-
-            # Resposta:
-            # A - comando: END-OF-FILE - finaliza a tarefa, nao repassa comando para o cliente
-            # B - vazia: ausencia de item na lista
-            # C - string: json line, retirar quebra de linha
-
-            # A - COMANDO
-            if message == "END-OF-FILE" or message == "END-OF-LIST":
-                if DEBUG:
-                    print(f"[DEBUG] Tarefa sinalizou conclusao, encerrando")
-                break
+            # Contar mensagens no buffer
+            list_length = redis_client.llen(task_list)
+            if DEBUG:
+                print(f"[DEBUG] Itens na lista: {list_length}")
             #endif
 
-            # B - string vazia
-            if not message:
+            # Fim, sem chave, sem lista
+            if task_completed and not list_length:
                 if DEBUG:
-                    print(f"[DEBUG] EMPTY LIST")
-                # Sem mensagem
-                # Sem chave, encerrar
-                if key_missed:
-                    if DEBUG:
-                        print(f"[DEBUG] Chave ausente, lista vazia, finalizar streaming")
-                    break;
+                    print(f"[DEBUG] Chave ausente e lista vazia, finalizar streaming")
                 #endif
+                # Sair do loop principal
+                break;
+            #endif
+
+
+            # Lista vazia, pause demorada para espera do worker
+            if not list_length:
 
                 # Verificar timeout
                 current_time = time.time()
                 elapsed_since_last = (current_time - last_message_time) * 1000
                 if elapsed_since_last > MAXTIME:
-                    print(f"[WARN] Timeout atingido: {task_key}")
-                    yield MAXTIME_ERROR + '\n'
+                    if DEBUG:
+                        print(f"[DEBUG] Timeout atingido: {task_key}, elapsed {elapsed_since_last}, maxtime {MAXTIME}")
+                    #endif
+                    if MAXTIME_ERROR:
+                        yield MAXTIME_ERROR + '\n'
+                    #endif
                     break
                 #endif
 
-                # Chave persiste, aguardar intervalo e voltar ao inicio
-                time.sleep(INTERVAL / 1000.0)
-                continue
+                if DEBUG:
+                    print(f"[DEBUG] Lista vazia, aguardar worker {slow_interval}s, elapsed {elapsed_since_last}")
+                #endif
 
+                # esperar...
+                time.sleep(slow_interval)
+                continue;
             #endif
 
-            # C - String presente, tratar e responder ao cliente
-            if DEBUG:
-                print(f"[DEBUG] Mensagem recebida: [{message}]")
 
-            # Sem quebra de linha
-            json_line = message.replace("\n", "")
-            yield json_line + '\n'
-
-            last_message_time = time.time()
-
-            # Novo loop para esgotar a lista
-            if DEBUG:
-                print(f"[DEBUG] DUMP LIST")
-            while True:
-                message = redis_client.lpop(task_list)
-                if message:
+            # Faz um loop para dar LPOP até esvaziar
+            for item_id in range(list_length):
+                # Coletar mensagem
+                raw_item = redis_client.lpop(task_list)
+                if raw_item is None:
                     if DEBUG:
-                        print(f"[DEBUG] Mensagem recebida (descarga): [{message}]")
+                        print(f"[DEBUG] Item de entrada vazio (2), ignorando")
+                    #endif
+                    continue;
+                #endif
 
-                    json_line = message.replace("\n", "")
-                    yield json_line + '\n'
+                # Retirar espacos
+                message = raw_item.strip()
 
-                    last_message_time = time.time()
-                else:
+                # Sem mensagem, sumiu misteriosamente...
+                if not message:
                     if DEBUG:
-                        print(f"[DEBUG] Lista esgotada")
+                        print(f"[DEBUG] Item de entrada vazio (2), ignorando")
+                    #endif
+                    continue
+                #endif
+
+                # COMANDO
+                if message in ("END-OF-FILE", "END-OF-LIST", "EOL", "EOF"):
+                    # Tarefa concluida a pedido do worker
+                    task_completed = True
+                    if DEBUG:
+                        print(f"[DEBUG] Worker sinalizou conclusao ({message}), encerrando")
+                    #endif
                     break
-            # Fim do loop esgotador
+                #endif
 
-            # Pausa após enviar linhas detectadas
-            time.sleep(PAUSE / 1000.0)
+                # JSON de saida ao cliente:
+                last_message_time = time.time()
+                json_line = message.replace("\n", "")
+                if DEBUG:
+                    print(f"[DEBUG] Worker enviou: {json_line}")
+                #endif
+                yield json_line + '\n'
 
-            # # Chave nao encontrada no inicio do loop, encerrar
-            # if key_missed:
-            #     print(f"[INFO] Chave ausente, finalizar streaming")
-            #     break
-            # #endif
-
+                # Pause entre envio de mensagens
+                time.sleep(fast_interval)
+            #done
         #endwhile
     #endtry
 
@@ -457,7 +460,6 @@ def handle_request(path):
         stream_with_context(stream_generator(task_uuid, task_key, task_list)),
         mimetype='application/x-ndjson',
         headers={
-            'Server': SERVERNAME,
             'X-Author': 'Patrick Brandao <patrickbrandao@gmail.com>',
             'X-Task-UUID': task_uuid,
             'X-Task-Key': task_key,
@@ -480,8 +482,6 @@ def add_server_header(response):
     Retorno:
         Response: Resposta com cabeçalhos adicionados
     """
-    if 'Server' not in response.headers:
-        response.headers['Server'] = SERVERNAME
     if 'X-Author' not in response.headers:
         response.headers['X-Author'] = 'Patrick Brandao <patrickbrandao@gmail.com>'
     return response
@@ -517,7 +517,6 @@ def main():
     print(f"[CONFIG] Intervalo: {INTERVAL}ms")
     print(f"[CONFIG] Pausa: {PAUSE}ms")
     print(f"[CONFIG] Timeout: {MAXTIME}ms")
-    print(f"[CONFIG] Nome servidor: {SERVERNAME}\n")
     
     # Iniciar servidor Flask
     print(f"[INFO] Iniciando servidor na porta {HTTP_PORT}...\n")
